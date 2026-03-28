@@ -11,12 +11,19 @@ Feed rules:
   - Maximum 25 items (oldest removed first when exceeded)
 
 Runs once a week via GitHub Actions.
+
+Search strategy:
+  Uses YouTube's own before:/after: search operators via yt-dlp URL
+  extraction, so YouTube itself filters to the correct date range.
+  Example URL that yt-dlp processes:
+    https://www.youtube.com/results?search_query=D%26D+after%3A2016-03-25+before%3A2016-04-01
 """
 
 import json
 import logging
 import subprocess
 import sys
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -34,11 +41,10 @@ RETENTION_DAYS = 30
 VIDEOS_PER_RUN = 10
 YEARS_AGO = 10
 
-# Search queries to try (we'll take the top results across these)
+# Search queries — each will be combined with date operators
 SEARCH_QUERIES = [
+    "D&D",
     "Dungeons and Dragons",
-    "D&D tabletop",
-    "D&D campaign",
     "DnD 5e",
 ]
 
@@ -61,8 +67,7 @@ log = logging.getLogger("dnd_time_capsule")
 def get_search_window() -> tuple[datetime, datetime]:
     """
     Return (start, end) for a 7-day window centred on today-minus-10-years.
-    The window runs from 3 days before to 4 days after the anniversary date
-    so we get a full week.
+    The window runs from 3 days before to 4 days after the anniversary date.
     """
     today = datetime.now(timezone.utc).date()
     try:
@@ -72,7 +77,7 @@ def get_search_window() -> tuple[datetime, datetime]:
         anniversary = today.replace(year=today.year - YEARS_AGO, day=28)
 
     start = anniversary - timedelta(days=3)
-    end = anniversary + timedelta(days=4)  # exclusive upper bound for search
+    end = anniversary + timedelta(days=4)
     return (
         datetime(start.year, start.month, start.day, tzinfo=timezone.utc),
         datetime(end.year, end.month, end.day, tzinfo=timezone.utc),
@@ -80,32 +85,38 @@ def get_search_window() -> tuple[datetime, datetime]:
 
 
 # ---------------------------------------------------------------------------
-# YouTube search via yt-dlp
+# YouTube search via yt-dlp + YouTube date operators
 # ---------------------------------------------------------------------------
 
 
-def search_youtube(query: str, start: datetime, end: datetime, max_results: int = 10) -> list[dict]:
+def build_youtube_search_url(query: str, after_date: str, before_date: str) -> str:
     """
-    Use yt-dlp to search YouTube and return video metadata.
-    We use ytsearch to get candidates, then filter by upload date.
+    Build a YouTube search URL with before:/after: date operators.
+    YouTube recognizes these operators in the search query itself.
+
+    after_date / before_date should be YYYY-MM-DD strings.
     """
-    # yt-dlp's daterange filter uses YYYYMMDD format
-    date_start = start.strftime("%Y%m%d")
-    date_end = end.strftime("%Y%m%d")
+    full_query = f"{query} after:{after_date} before:{before_date}"
+    encoded = urllib.parse.quote(full_query)
+    return f"https://www.youtube.com/results?search_query={encoded}"
 
-    # Request more than we need since we'll filter by date
-    search_term = f"ytsearch50:{query}"
 
+def search_youtube_by_url(search_url: str, max_results: int = 30) -> list[dict]:
+    """
+    Use yt-dlp to extract video entries from a YouTube search results URL.
+    Returns a list of video dicts with metadata.
+    """
     cmd = [
         "yt-dlp",
         "--dump-json",
         "--flat-playlist",
         "--no-download",
         "--no-warnings",
-        search_term,
+        "--playlist-end", str(max_results),
+        search_url,
     ]
 
-    log.info("Searching YouTube: %s (window %s to %s)", query, date_start, date_end)
+    log.info("  yt-dlp extracting: %s", search_url)
 
     try:
         result = subprocess.run(
@@ -115,12 +126,13 @@ def search_youtube(query: str, start: datetime, end: datetime, max_results: int 
             timeout=120,
         )
     except subprocess.TimeoutExpired:
-        log.error("yt-dlp search timed out for query: %s", query)
+        log.error("yt-dlp timed out for URL: %s", search_url)
         return []
 
     if result.returncode != 0:
-        log.warning("yt-dlp returned code %d for query: %s", result.returncode, query)
-        log.warning("stderr: %s", result.stderr[:500] if result.stderr else "(none)")
+        log.warning("yt-dlp returned code %d", result.returncode)
+        if result.stderr:
+            log.warning("stderr: %s", result.stderr[:500])
 
     videos = []
     for line in result.stdout.strip().split("\n"):
@@ -131,36 +143,36 @@ def search_youtube(query: str, start: datetime, end: datetime, max_results: int 
         except json.JSONDecodeError:
             continue
 
-        # flat-playlist gives us limited info; we need the upload_date
-        # If upload_date is present in flat mode, use it; otherwise we'll
-        # do a second pass for promising candidates
-        upload_date = data.get("upload_date", "")
-
         video = {
             "id": data.get("id", ""),
             "title": data.get("title", "(no title)"),
-            "url": data.get("url") or data.get("webpage_url") or f"https://www.youtube.com/watch?v={data.get('id', '')}",
-            "upload_date": upload_date,
+            "url": data.get("webpage_url") or data.get("url") or "",
+            "upload_date": data.get("upload_date", ""),
             "description": (data.get("description") or "")[:300],
             "channel": data.get("channel") or data.get("uploader") or "",
             "view_count": data.get("view_count") or 0,
             "duration": data.get("duration") or 0,
+            "thumbnail": data.get("thumbnail") or "",
         }
+
+        # Ensure we have a proper URL
+        if video["id"] and not video["url"]:
+            video["url"] = f"https://www.youtube.com/watch?v={video['id']}"
 
         if video["id"]:
             videos.append(video)
 
-    log.info("  Got %d raw results for '%s'", len(videos), query)
     return videos
 
 
-def fetch_video_details(video_ids: list[str], start: datetime, end: datetime) -> list[dict]:
+def enrich_videos(video_ids: list[str]) -> dict[str, dict]:
     """
-    Fetch full metadata for specific video IDs to get accurate upload dates.
-    Filter to only those within our date window.
+    Fetch full metadata (view_count, description, thumbnail, upload_date)
+    for a list of video IDs. No date filtering — we trust YouTube's search
+    already filtered by date. Returns a dict keyed by video ID.
     """
-    date_start = start.strftime("%Y%m%d")
-    date_end = end.strftime("%Y%m%d")
+    if not video_ids:
+        return {}
 
     urls = [f"https://www.youtube.com/watch?v={vid}" for vid in video_ids]
 
@@ -169,12 +181,10 @@ def fetch_video_details(video_ids: list[str], start: datetime, end: datetime) ->
         "--dump-json",
         "--no-download",
         "--no-warnings",
-        "--dateafter", date_start,
-        "--datebefore", date_end,
+        "--ignore-errors",
     ] + urls
 
-    log.info("Fetching details for %d videos (filtering %s to %s)...",
-             len(video_ids), date_start, date_end)
+    log.info("Enriching %d videos with full metadata...", len(video_ids))
 
     try:
         result = subprocess.run(
@@ -184,10 +194,10 @@ def fetch_video_details(video_ids: list[str], start: datetime, end: datetime) ->
             timeout=300,
         )
     except subprocess.TimeoutExpired:
-        log.error("yt-dlp detail fetch timed out")
-        return []
+        log.error("yt-dlp enrichment timed out")
+        return {}
 
-    videos = []
+    enriched = {}
     for line in result.stdout.strip().split("\n"):
         if not line.strip():
             continue
@@ -196,75 +206,80 @@ def fetch_video_details(video_ids: list[str], start: datetime, end: datetime) ->
         except json.JSONDecodeError:
             continue
 
-        video = {
-            "id": data.get("id", ""),
-            "title": data.get("title", "(no title)"),
-            "url": data.get("webpage_url") or f"https://www.youtube.com/watch?v={data.get('id', '')}",
-            "upload_date": data.get("upload_date", ""),
-            "description": (data.get("description") or "")[:300],
-            "channel": data.get("channel") or data.get("uploader") or "",
-            "view_count": data.get("view_count") or 0,
-            "duration": data.get("duration") or 0,
-            "thumbnail": data.get("thumbnail") or "",
-        }
+        vid = data.get("id", "")
+        if vid:
+            enriched[vid] = {
+                "id": vid,
+                "title": data.get("title", "(no title)"),
+                "url": data.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}",
+                "upload_date": data.get("upload_date", ""),
+                "description": (data.get("description") or "")[:300],
+                "channel": data.get("channel") or data.get("uploader") or "",
+                "view_count": data.get("view_count") or 0,
+                "duration": data.get("duration") or 0,
+                "thumbnail": data.get("thumbnail") or "",
+            }
 
-        videos.append(video)
-
-    log.info("  %d videos matched the date window", len(videos))
-    return videos
+    log.info("  Enriched %d / %d videos", len(enriched), len(video_ids))
+    return enriched
 
 
 def find_top_videos(start: datetime, end: datetime) -> list[dict]:
     """
-    Search across multiple queries, deduplicate, fetch details with date
-    filtering, and return the top 10 by view count.
+    Search YouTube with date operators, deduplicate across queries,
+    enrich with full metadata, and return the top 10 by view count.
     """
-    # Phase 1: Collect candidate video IDs from flat search
-    candidate_ids = {}
+    after_str = start.strftime("%Y-%m-%d")
+    before_str = end.strftime("%Y-%m-%d")
+
+    # Phase 1: Collect candidate video IDs via YouTube search URLs
+    candidates = {}  # id -> video dict
     for query in SEARCH_QUERIES:
-        results = search_youtube(query, start, end)
+        url = build_youtube_search_url(query, after_str, before_str)
+        log.info("Searching: '%s' (%s to %s)", query, after_str, before_str)
+        results = search_youtube_by_url(url, max_results=30)
+        log.info("  Got %d results for '%s'", len(results), query)
         for v in results:
             vid = v["id"]
-            if vid not in candidate_ids:
-                candidate_ids[vid] = v
+            if vid not in candidates:
+                candidates[vid] = v
 
-    log.info("Total unique candidates across all queries: %d", len(candidate_ids))
+    log.info("Total unique candidates: %d", len(candidates))
 
-    if not candidate_ids:
-        log.warning("No candidates found at all.")
+    if not candidates:
+        log.warning("No candidates found.")
         return []
 
-    # Phase 2: Fetch full details with date filtering
-    # Process in batches to avoid overwhelming yt-dlp
-    all_ids = list(candidate_ids.keys())
-    detailed = []
-    batch_size = 25
+    # Phase 2: Enrich with full metadata (view_count, etc.)
+    # Flat-playlist mode often lacks view_count, so we fetch full details.
+    # Process in batches.
+    all_ids = list(candidates.keys())
+    enriched = {}
+    batch_size = 20
 
     for i in range(0, len(all_ids), batch_size):
         batch = all_ids[i:i + batch_size]
-        batch_results = fetch_video_details(batch, start, end)
-        detailed.extend(batch_results)
+        batch_enriched = enrich_videos(batch)
+        enriched.update(batch_enriched)
 
-    if not detailed:
-        # Fallback: if detail fetching found nothing (maybe date filtering
-        # was too strict or yt-dlp couldn't get dates), use flat results
-        # that have upload_date in the right range
-        date_start = start.strftime("%Y%m%d")
-        date_end = end.strftime("%Y%m%d")
-        log.info("Detail fetch returned nothing; falling back to flat results with date check")
-        for v in candidate_ids.values():
-            ud = v.get("upload_date", "")
-            if ud and date_start <= ud <= date_end:
-                detailed.append(v)
+    # Merge: prefer enriched data, fall back to flat data
+    final = []
+    for vid, flat in candidates.items():
+        if vid in enriched:
+            final.append(enriched[vid])
+        else:
+            # Use flat data as-is (may lack view_count)
+            final.append(flat)
 
-    # Sort by view count descending and take top N
-    detailed.sort(key=lambda v: v.get("view_count", 0), reverse=True)
-    top = detailed[:VIDEOS_PER_RUN]
+    # Sort by view count descending, take top N
+    final.sort(key=lambda v: v.get("view_count", 0), reverse=True)
+    top = final[:VIDEOS_PER_RUN]
 
     log.info("Top %d videos selected:", len(top))
     for v in top:
+        views = v.get("view_count", 0)
         log.info("  [%s views] %s — %s",
-                 f"{v.get('view_count', 0):,}", v["title"], v["url"])
+                 f"{views:,}" if views else "?", v["title"], v["url"])
 
     return top
 
@@ -303,7 +318,6 @@ def merge_items(existing: list[dict], new_videos: list[dict]) -> list[dict]:
     cutoff = now - timedelta(days=RETENTION_DAYS)
     cutoff_iso = cutoff.isoformat()
 
-    # Build lookup of existing IDs
     seen_ids = set()
     merged = []
 
@@ -403,7 +417,7 @@ def generate_feed(items: list[dict]) -> None:
 
         fe.description("\n".join(desc_parts))
 
-        # Use the added_at timestamp as pubDate so feed readers sort correctly
+        # Use the added_at timestamp as pubDate
         added_at = item.get("added_at", "")
         if added_at:
             try:
