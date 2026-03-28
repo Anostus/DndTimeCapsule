@@ -1,0 +1,49 @@
+name: D&D Time Capsule
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  schedule:
+    # Run once a week: Sunday at 10:00 UTC
+    - cron: "0 10 * * 0"
+  workflow_dispatch: # Allow manual triggers
+
+permissions:
+  contents: write
+
+jobs:
+  update-feed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install yt-dlp
+        run: pip install yt-dlp
+
+      - name: Run D&D Time Capsule
+        run: python dnd_time_capsule.py
+
+      - name: Commit and push updated feed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/feed.xml data/feed_items.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update D&D Time Capsule feed [$(date -u '+%Y-%m-%d %H:%M UTC')]"
+            git push
+          fi
