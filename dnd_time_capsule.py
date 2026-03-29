@@ -39,7 +39,7 @@ FEED_DB_PATH = "data/feed_items.json"  # persistent store of current items
 MAX_ITEMS = 25
 RETENTION_DAYS = 30
 VIDEOS_PER_RUN = 10
-YEARS_AGO = 10
+YEARS_AGO = 12
 
 # Search queries — each will be combined with date operators
 SEARCH_QUERIES = [
